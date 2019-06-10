@@ -6,7 +6,7 @@ from .. import util
 from .material import *
 from .skeleton import Skeleton
 
-def dot_mesh( ob, path, force_name=None, ignore_shape_animation=False, normals=True, isLOD=False, **kwargs):
+def dot_mesh_too_big(ob, path, force_name=None, ignore_shape_animation=False, normals=True, isLOD=False, **kwargs):
     """
     export the vertices of an object into a .mesh file
 
@@ -40,20 +40,7 @@ def dot_mesh( ob, path, force_name=None, ignore_shape_animation=False, normals=T
     Report.faces += len( ob.data.tessfaces )
     Report.orig_vertices += len( ob.data.vertices )
 
-    cleanup = False
-    if ob.modifiers:
-        cleanup = True
-        copy = ob.copy()
-        #bpy.context.scene.objects.link(copy)
-        rem = []
-        for mod in copy.modifiers:        # remove armature and array modifiers before collaspe
-            if mod.type in 'ARMATURE ARRAY'.split(): rem.append( mod )
-        for mod in rem: copy.modifiers.remove( mod )
-        # bake mesh
-        mesh = copy.to_mesh(bpy.context.scene, True, "PREVIEW")    # collaspe
-    else:
-        copy = ob
-        mesh = ob.data
+    mesh = get_prepared_mesh(ob)
 
     if logging:
         print('      - Generating:', '%s.mesh.xml' % obj_name)
@@ -83,50 +70,19 @@ def dot_mesh( ob, path, force_name=None, ignore_shape_animation=False, normals=T
 
         # Vertex colors, note that you can define a vertex color
         # material. see 'vertex_color_materials' below!
-        vcolors = None
-        vcolors_alpha = None
-        if len( mesh.tessface_vertex_colors ):
-            vcolors = mesh.tessface_vertex_colors[0]
-            for bloc in mesh.tessface_vertex_colors:
-                if bloc.name.lower().startswith('alpha'):
-                    vcolors_alpha = bloc; break
+        (vcolors, vcolors_alpha) = get_vertex_colors(mesh)
 
         # Materials
         # saves tuples of material name and material obj (or None)
-        materials = []
-        # a material named 'vertex.color.<yourname>' will overwrite
-        # the diffuse color in the mesh file!
-        vertex_color_materials = []
-        for mat in ob.data.materials:
-            mat_name = "_missing_material_"
-            if mat is not None:
-                mat_name = mat.name
-            mat_name = material_name(mat_name, prefix=material_prefix)
-            extern = False
-            if mat_name.startswith("extern."):
-                mat_name = mat_name[len("extern."):]
-                extern = True
-            if mat:
-                materials.append( (mat_name, extern, mat) )
-            else:
-                print('[WARNING:] Bad material data in', ob)
-                materials.append( ('_missing_material_', True, None) ) # fixed dec22, keep proper index
-        if not materials:
-            materials.append( ('_missing_material_', True, None) )
+        materials = get_mesh_materials(mesh)
+
         vertex_groups = {}
         material_faces = []
         for matidx, mat in enumerate(materials):
             material_faces.append([])
 
         # Textures
-        dotextures = False
-        uvcache = [] # should get a little speed boost by this cache
-        if mesh.tessface_uv_textures.active:
-            dotextures = True
-            for layer in mesh.tessface_uv_textures:
-                uvs = []; uvcache.append( uvs ) # layer contains: name, active, data
-                for uvface in layer.data:
-                    uvs.append( (uvface.uv1, uvface.uv2, uvface.uv3, uvface.uv4) )
+        (dotextures, uvcache) = get_mesh_textures(mesh)
 
         shared_vertices = {}
         _remap_verts_ = []
@@ -175,6 +131,7 @@ def dot_mesh( ob, path, force_name=None, ignore_shape_animation=False, normals=T
                         support smooth shading, what about seems, smoothing groups, materials, ...)
                     '''
                     vert = VertexNoPos(numverts, nx, ny, nz, r, g, b, ra, vert_uvs)
+
                     alreadyExported = False
                     if idx in shared_vertices:
                         for vert2 in shared_vertices[idx]:
@@ -296,8 +253,6 @@ def dot_mesh( ob, path, force_name=None, ignore_shape_animation=False, normals=T
         doc.end_tag('submeshes')
 
         # Submesh names
-        # todo: why is the submesh name taken from the material
-        # when we have the blender object name available?
         doc.start_tag('submeshnames', {})
         for matidx, (mat_name, extern, mat) in enumerate(materials):
             doc.leaf_tag('submesh', {
@@ -633,6 +588,264 @@ def dot_mesh( ob, path, force_name=None, ignore_shape_animation=False, normals=T
     logging.info('      - Created .mesh in total time %s seconds', timer_diff_str(start))
 
     return mats
+
+def dot_mesh(ob, path, force_name=None, ignore_shape_animation=False, normals=True, isLOD=False, **kwargs):
+    """
+    export the vertices of an object into a .mesh file
+
+    ob: the blender object
+    path: the path to save the .mesh file to. path MUST exist
+    force_name: force a different name for this .mesh
+    kwargs:
+      * material_prefix - string. (optional)
+      * overwrite - bool. (optional) default False
+    """
+    obj_name = force_name or ob.data.name
+    obj_name = clean_object_name(obj_name)
+    target_file = os.path.join(path, '%s.mesh.xml' % obj_name )
+
+    material_prefix = kwargs.get('material_prefix', '')
+    overwrite = kwargs.get('overwrite', False)
+
+    if os.path.isfile(target_file) and not overwrite:
+        return []
+
+    if not os.path.isdir( path ):
+        os.makedirs( path )
+
+    start = time.time()
+
+    # blender per default does not calculate these. when querying the quads/tris 
+    # of the object blender would crash if calc_tessface was not updated
+    ob.data.update(calc_tessface=True)
+
+    Report.meshes.append( obj_name )
+    Report.faces += len( ob.data.tessfaces )
+    Report.orig_vertices += len( ob.data.vertices )
+
+    mesh = get_prepared_mesh(ob)
+
+    if logging:
+        print('      - Generating:', '%s.mesh.xml' % obj_name)
+
+    try:
+        with open(target_file, 'w') as f:
+            f.flush()
+    except Exception as e:
+        show_dialog("Invalid mesh object name: " + obj_name)
+        return
+
+    # ok, preliminary stuff is out of the way. Start saving the file.
+    with open(target_file, 'w') as f:
+        doc = SimpleSaxWriter(f, 'mesh', {})
+        # calculate the correct geometry
+        calculate_shared_geometry()
+
+        # call appropriate save method. Possibly factory pattern?        
+        write_shared_geometry(doc)
+
+
+
+
+def write_shared_geometry(doc, mesh):
+    if logging:
+        print('      - Writing shared geometry')
+
+def write_split_geometry(doc, mesh):
+    if logging:
+        print('      - Writing split geometry')
+
+def collect_mesh_data(mesh, use_shared_geometry = True):
+    # Materials
+    materials = get_mesh_materials(mesh)
+
+    # A place to hold the faces by material
+    # saves tuples of material name and material obj (or None)
+    material_faces = []
+    for matidx, mat in enumerate(materials):
+        material_faces.append([])
+
+    vertex_groups = {}
+    shared_vertices = {}
+    _remap_verts_ = []
+    numverts = 0
+
+    # Textures
+    (dotextures, uvcache) = get_mesh_textures(mesh)
+
+    # Vertex colors, note that you can define a vertex color
+    # material. see 'vertex_color_materials' below!
+    (vcolors, vcolors_alpha) = get_vertex_colors(mesh)
+
+
+    sharedgeometry_vertex_count = 0
+    submesh_vertex_count = 0
+    colors_diffuse = str(bool( mesh.vertex_colors ))
+    texture_coords : '%s' % len(mesh.uv_textures) if mesh.uv_textures.active else '0'
+
+    for F in mesh.tessfaces:
+        append_face_data(F, faces, shared_vertices)
+
+    Report.vertices += numverts
+
+    if logging:
+        print('        Done at', timer_diff_str(start), "seconds")
+        print('      - Writing submeshes')
+
+
+
+def append_face_data(F, faces, shared_vertices):
+    tris = []
+    smooth = F.use_smooth
+
+    tris.append( (F.vertices[0], F.vertices[1], F.vertices[2]) )
+    if len(F.vertices) >= 4:
+        tris.append( (F.vertices[0], F.vertices[2], F.vertices[3]) )
+
+    if dotextures:
+        a = []; b = []
+        uvtris = [ a, b ]
+        for layer in uvcache:
+            uv1, uv2, uv3, uv4 = layer[ F.index ]
+            a.append( (uv1, uv2, uv3) )
+            b.append( (uv1, uv3, uv4) )
+
+            for tidx, tri in enumerate(tris):
+                append_tris_data(tidx, tri, faces, shared_vertices)
+
+def append_tris_data(tidx, tri, faces, shared_vertices):
+    face = []
+    for vidx, idx in enumerate(tri):
+        v = mesh.vertices[ idx ]
+
+        if smooth:
+            nx,ny,nz = swap( v.normal ) # fixed june 17th 2011
+        else:
+            nx,ny,nz = swap( F.normal )
+
+        export_vertex_color, color_tuple = \
+                extract_vertex_color(vcolors, vcolors_alpha, F, idx)
+        r,g,b,ra = color_tuple
+
+        # Texture maps
+        vert_uvs = []
+        if dotextures:
+            for layer in uvtris[ tidx ]:
+                vert_uvs.append(layer[ vidx ])
+
+        ''' Check if we already exported that vertex with same normal, do not export in that case,
+            (flat shading in blender seems to work with face normals, so we copy each flat face'
+            vertices, if this vertex with same normals was already exported,
+            todo: maybe not best solution, check other ways (let blender do all the work, or only
+            support smooth shading, what about seems, smoothing groups, materials, ...)
+        '''
+        vert = VertexNoPos(numverts, nx, ny, nz, r, g, b, ra, vert_uvs)
+        if check_exported_and_append(vert, shared_vertices, face):
+            continue
+
+        numverts += 1
+        _remap_verts_.append( v )
+
+        x,y,z = swap(v.co)        # xz-y is correct!
+
+    append_triangle_in_vertex_group(mesh, ob, vertex_groups, face, tri)
+    faces.append( (face[0], face[1], face[2]) )
+
+
+
+def check_exported_and_append(vert):
+    alreadyExported = False
+    if idx in shared_vertices:
+        for vert2 in shared_vertices[idx]:
+            #does not compare ogre_vidx (and position at the moment)
+            if vert == vert2:
+                face.append(vert2.ogre_vidx)
+                alreadyExported = True
+                #print(idx,numverts, nx,ny,nz, r,g,b,ra, vert_uvs, "already exported")
+                break
+        if not alreadyExported:
+            face.append(vert.ogre_vidx)
+            shared_vertices[idx].append(vert)
+            #print(numverts, nx,ny,nz, r,g,b,ra, vert_uvs, "appended")
+    else:
+        face.append(vert.ogre_vidx)
+        shared_vertices[idx] = [vert]
+        #print(idx, numverts, nx,ny,nz, r,g,b,ra, vert_uvs, "created")
+    
+    return alreadyExported
+
+
+# Prepare the mesh for export.
+def get_prepared_mesh(ob):
+    cleanup = False
+    if ob.modifiers:
+        cleanup = True
+        copy = ob.copy()
+        rem = []
+        for mod in copy.modifiers:        # remove armature and array modifiers before collaspe
+            if mod.type in 'ARMATURE ARRAY'.split(): rem.append( mod )
+        for mod in rem: copy.modifiers.remove( mod )
+        # bake mesh
+        mesh = copy.to_mesh(bpy.context.scene, True, "PREVIEW")    # collaspe
+    else:
+        copy = ob
+        mesh = ob.data
+    
+    return mesh
+
+# Get the vertex colors including alpha for the mesh
+def get_vertex_colors(mesh):
+    # Vertex colors, note that you can define a vertex color
+    # material. see 'vertex_color_materials' below!
+    vcolors = None
+    vcolors_alpha = None
+    if len( mesh.tessface_vertex_colors ):
+        vcolors = mesh.tessface_vertex_colors[0]
+        for bloc in mesh.tessface_vertex_colors:
+            if bloc.name.lower().startswith('alpha'):
+                vcolors_alpha = bloc; break
+    return (vcolors, vcolors_alpha)
+
+# Get the materials for the mesh
+def get_mesh_materials(mesh):
+    # Materials
+    # saves tuples of material name and material obj (or None)
+    materials = []
+    # a material named 'vertex.color.<yourname>' will overwrite
+    # the diffuse color in the mesh file!
+    vertex_color_materials = []
+    for mat in ob.data.materials:
+        mat_name = "_missing_material_"
+        if mat is not None:
+            mat_name = mat.name
+        mat_name = material_name(mat_name, prefix=material_prefix)
+        extern = False
+        if mat_name.startswith("extern."):
+            mat_name = mat_name[len("extern."):]
+            extern = True
+        if mat:
+            materials.append( (mat_name, extern, mat) )
+        else:
+            print('[WARNING:] Bad material data in', ob)
+            materials.append( ('_missing_material_', True, None) ) # fixed dec22, keep proper index
+    if not materials:
+        materials.append( ('_missing_material_', True, None) )
+
+    return matierals
+
+# Get the textures and uv coordinates for the mesh
+def get_mesh_textures(mesh):
+    # Textures
+    dotextures = False
+    uvcache = [] # should get a little speed boost by this cache
+    if mesh.tessface_uv_textures.active:
+        dotextures = True
+        for layer in mesh.tessface_uv_textures:
+            uvs = []; uvcache.append( uvs ) # layer contains: name, active, data
+            for uvface in layer.data:
+                uvs.append( (uvface.uv1, uvface.uv2, uvface.uv3, uvface.uv4) )
+    return (dotextures, uvcache)
+
 
 def triangle_list_in_group(mesh, shared_vertices, group_index):
     faces = []
